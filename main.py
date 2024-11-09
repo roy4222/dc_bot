@@ -13,6 +13,7 @@ import functions_framework
 import threading
 import asyncio
 from flask import Flask
+import time
 
 app = Flask(__name__)
 
@@ -51,34 +52,29 @@ class TimeContext:
         self.tz = pytz.timezone('Asia/Taipei')
     
     def get_current_time(self) -> datetime:
-        """獲取當前台灣時間"""
-        return datetime.now(self.tz)
+        """獲取當前台北時間"""
+        # 使用 utc 時間然後轉換到當地時區，這是處理時區的正確方式
+        utc_now = pytz.utc.localize(datetime.utcnow())
+        return utc_now.astimezone(self.tz)
     
-    def get_formatted_time(self) -> str:
-        """獲取格式化的時間字符串"""
-        return self.get_current_time().strftime("%Y-%m-%d %H:%M:%S")
-    
-    def get_time_greeting(self) -> str:
-        """根據當前實時時間返回準確的問候語"""
+    def get_greeting(self) -> str:
+        """返回簡單的時間相關問候語，不帶具體時間"""
         current_time = self.get_current_time()
         hour = current_time.hour
-        minute = current_time.minute
         
         if 5 <= hour < 11:
-            return f"早安！現在是早上 {hour:02d}:{minute:02d}"
-        elif hour == 11:
-            return f"快中午了！現在是 {hour:02d}:{minute:02d}"
-        elif 12 <= hour < 13:
-            return f"中午好！現在是 {hour:02d}:{minute:02d}"
+            return "早安！"
+        elif 11 <= hour < 13:
+            return "午安！"
         elif 13 <= hour < 18:
-            return f"午安！現在是下午 {hour:02d}:{minute:02d}"
+            return "下午好！"
         elif 18 <= hour < 22:
-            return f"晚上好！現在是晚上 {hour:02d}:{minute:02d}"
+            return "晚安！"
         else:
-            return f"夜深了！現在是凌晨 {hour:02d}:{minute:02d}"
+            return "夜安！"
     
-    def get_detailed_time_context(self) -> str:
-        """獲取詳細的時間上下文信息"""
+    def get_detailed_context(self) -> str:
+        """只在直接詢問時間時使用"""
         current_time = self.get_current_time()
         weekday_mapping = {
             0: '一',
@@ -90,21 +86,54 @@ class TimeContext:
             6: '日'
         }
         weekday = weekday_mapping[current_time.weekday()]
-        return f"現在是 {current_time.strftime('%Y年%m月%d日')} 星期{weekday} {current_time.strftime('%H:%M:%S')}"
+        
+        return (
+            f"現在是 {current_time.strftime('%m')}月{current_time.strftime('%d')}號"
+            f" 星期{weekday}"
+            f" {current_time.strftime('%H:%M')}"
+        )
+    
+    def get_formatted_time(self) -> str:
+        """獲取格式化的時間字符串，用於存儲"""
+        current_time = self.get_current_time()
+        return current_time.strftime("%Y-%m-%d %H:%M:%S")
 
 class MessageHandler:
     def __init__(self):
         self.time_context = TimeContext()
+        self._last_time_mention = 0
         
     def enhance_message_with_time_context(self, msg: str) -> str:
-        """根據實時時間增強訊息內容"""
-        greeting_keywords = ['hi', 'hello', '你好', '哈囉', '早', '午', '晚']
-        time_related_keywords = ['幾點', '現在時間', '時間', '日期', '幾號']
+        """保持原有方法名稱的兼容性，內部調用 enhance_message"""
+        return self.enhance_message(msg)
         
-        if any(keyword in msg.lower() for keyword in greeting_keywords):
-            return f"{self.time_context.get_time_greeting()} {msg}"
-        elif any(keyword in msg for keyword in time_related_keywords):
-            return f"{self.time_context.get_detailed_time_context()}\n{msg}"
+    def enhance_message(self, msg: str) -> str:
+        """增強消息內容，但避免過度強調時間"""
+        current_time = time.time()
+        
+        # 定義關鍵詞和其重要性
+        patterns = {
+            'high_priority': ['幾點', '現在時間', '日期', '幾號'],  # 直接詢問時間的關鍵詞
+            'low_priority': ['早', '午', '晚', 'hi', 'hello', '你好', '哈囉']  # 日常問候詞
+        }
+        
+        # 檢查是否包含高優先級時間相關關鍵詞
+        if any(keyword in msg for keyword in patterns['high_priority']):
+            return f"{self.time_context.get_detailed_context()}\n{msg}"
+            
+        # 檢查是否包含低優先級問候語
+        if any(keyword in msg.lower() for keyword in patterns['low_priority']):
+            # 如果距離上次提到時間超過30分鐘，才加入時間問候
+            if current_time - self._last_time_mention > 1800:  # 1800秒 = 30分鐘
+                self._last_time_mention = current_time
+                greeting = self.time_context.get_greeting()
+                # 只返回問候語，不附加具體時間
+                return f"{greeting} {msg}"
+            else:
+                # 如果最近才提過時間，就只回覆簡單的問候
+                return f"你好！{msg}"
+                
+        # 對於其他消息，直接返回原始消息
         return msg
 
 def choose_model_based_on_message(msg: str, fallback_level: int = 0) -> str:
@@ -165,8 +194,8 @@ async def get_ai_response(msg: str, user_id: str, conversation_history: List[Dic
         with open("character_description.txt", "r", encoding="utf-8") as file:
             character_description = file.read()
         
-        time_context = TimeContext()
-        system_prompt = f"{character_description}\n{time_context.get_detailed_time_context()}"
+        
+        system_prompt = character_description
         
         payload = {
             "model": model_name,
