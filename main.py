@@ -1,25 +1,31 @@
-import discord
-from discord.ext import commands
-import logging
-import requests
-import json
 import os
-import firebase_admin
-from firebase_admin import credentials, db
-from datetime import datetime
-import pytz
-from typing import Dict, List, Optional
-import functions_framework
+import json
+import time
+import logging
 import threading
 import asyncio
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from datetime import time as datetime_time  # 為了避免與 time 模組衝突
+from typing import Dict, List, Optional
+
+import pytz
+import aiohttp
+import requests
+import firebase_admin
+from firebase_admin import credentials, db
+import discord
+from discord.ext import commands
+import functions_framework
 from flask import Flask
-import time
 
 app = Flask(__name__)
 
 # 設定 Discord Bot
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
+
 
 # 初始化 Discord bot
 intents = discord.Intents.default()
@@ -46,6 +52,148 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+
+@dataclass
+class WeatherData:
+    """天氣數據結構"""
+    location: str
+    temperature: float
+    feels_like: float
+    humidity: int
+    description: str
+    timestamp: datetime
+    
+    def to_dict(self) -> dict:
+        """轉換為字典格式以存儲到 Firebase"""
+        return {
+            "location": self.location,
+            "temperature": self.temperature,
+            "feels_like": self.feels_like,
+            "humidity": self.humidity,
+            "description": self.description,
+            "timestamp": self.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> 'WeatherData':
+        """從字典格式轉換回物件"""
+        return cls(
+            location=data["location"],
+            temperature=data["temperature"],
+            feels_like=data["feels_like"],
+            humidity=data["humidity"],
+            description=data["description"],
+            timestamp=datetime.strptime(data["timestamp"], "%Y-%m-%d %H:%M:%S")
+        )
+    
+    def format_message(self) -> str:
+        """格式化天氣信息"""
+        return (
+            f"📍 地點：{self.location}\n"
+            f"🌡️ 溫度：{self.temperature}°C\n"
+            f"🌡️ 體感溫度：{self.feels_like}°C\n"
+            f"💧 濕度：{self.humidity}%\n"
+            f"🌥️ 天氣狀況：{self.description}"
+        )
+
+class WeatherService:
+    def __init__(self, api_key: str, city_id: str = "1668341"):
+        self.api_key = api_key
+        self.city_id = city_id
+        self.api_url = "https://api.openweathermap.org/data/2.5/weather"
+        self.cached_data: Optional[WeatherData] = None
+        self.cache_time: Optional[float] = None
+        self.cache_duration = 1800  # 30分鐘緩存
+        self.subscribers: Dict[str, bool] = {}
+        self._load_subscribers()
+
+    async def get_weather(self) -> WeatherData:
+        """獲取天氣數據（優先使用緩存，但考慮過期時間）"""
+        current_time = time.time()
+        if (self.cached_data is None or 
+            self.cache_time is None or 
+            current_time - self.cache_time > self.cache_duration):
+            self.cached_data = await self.fetch_weather()
+            self.cache_time = current_time
+        return self.cached_data
+    
+    def _load_subscribers(self):
+        """從 Firebase 加載訂閱者"""
+        try:
+            ref = db.reference("weather_subscribers")
+            data = ref.get()
+            if data:
+                self.subscribers = data
+        except Exception as e:
+            logging.error(f"Failed to load weather subscribers: {e}")
+    
+    def save_subscribers(self):
+        """保存訂閱者到 Firebase"""
+        try:
+            ref = db.reference("weather_subscribers")
+            ref.set(self.subscribers)
+        except Exception as e:
+            logging.error(f"Failed to save weather subscribers: {e}")
+    
+    async def fetch_weather(self) -> WeatherData:
+        """從 OpenWeather API 獲取天氣數據"""
+        max_retries = 3
+        retry_delay = 1  # 初始延遲1秒
+        
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    params = {
+                        "id": self.city_id,
+                        "appid": self.api_key,
+                        "units": "metric",
+                        "lang": "zh_tw"
+                    }
+                    
+                    async with session.get(self.api_url, params=params) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            weather_data = WeatherData(
+                                location="臺北市",
+                                temperature=round(data["main"]["temp"], 1),
+                                feels_like=round(data["main"]["feels_like"], 1),
+                                humidity=data["main"]["humidity"],
+                                description=data["weather"][0]["description"],
+                                timestamp=datetime.now()
+                            )
+                            
+                            # 緩存數據
+                            self.cached_data = weather_data
+                            
+                            # 保存到 Firebase
+                            try:
+                                ref = db.reference("weather_data")
+                                ref.set(weather_data.to_dict())
+                            except Exception as e:
+                                logging.error(f"Failed to save weather data: {e}")
+                            
+                            return weather_data
+                        else:
+                            raise Exception(f"Weather API error: {response.status}")
+            except Exception as e:
+                if attempt == max_retries - 1:  # 最後一次嘗試
+                    raise
+                logging.warning(f"Attempt {attempt + 1} failed: {str(e)}, retrying...")
+                await asyncio.sleep(retry_delay * (2 ** attempt))  # 指數退避
+
+    def subscribe(self, user_id: str):
+        """訂閱天氣推播"""
+        self.subscribers[user_id] = True
+        self.save_subscribers()
+        logging.info(f"User {user_id} subscribed to weather updates")
+
+    def unsubscribe(self, user_id: str):
+        """取消訂閱天氣推播"""
+        if user_id in self.subscribers:
+            del self.subscribers[user_id]
+            self.save_subscribers()
+            logging.info(f"User {user_id} unsubscribed from weather updates")
+    
 
 class TimeContext:
     def __init__(self):
@@ -98,43 +246,158 @@ class TimeContext:
         current_time = self.get_current_time()
         return current_time.strftime("%Y-%m-%d %H:%M:%S")
 
+
 class MessageHandler:
-    def __init__(self):
+    def __init__(self, weather_service: WeatherService):
         self.time_context = TimeContext()
         self._last_time_mention = 0
+        self.weather_service = weather_service
         
-    def enhance_message_with_time_context(self, msg: str) -> str:
-        """保持原有方法名稱的兼容性，內部調用 enhance_message"""
-        return self.enhance_message(msg)
+        # 添加天氣相關關鍵詞
+        self.weather_patterns = {
+            'general': ['天氣', '天氣如何', '今天天氣'],
+            'temperature': ['溫度', '幾度', '熱不熱'],
+            'humidity': ['濕度', '溼度', '濕不濕'],
+            'feels_like': ['體感', '感覺溫度'],
+            'subscribe': ['訂閱天氣', '天氣訂閱'],
+            'unsubscribe': ['取消訂閱', '停止天氣推播']
+        }
+    
+    async def handle_weather_query(self, msg: str, user_id: str) -> Optional[str]:
+        """處理天氣相關查詢"""
+        # 訂閱相關
+        if any(keyword in msg for keyword in self.weather_patterns['subscribe']):
+            self.weather_service.subscribe(user_id)
+            return "已訂閱每日天氣推播！每天早上 6:00 我會告訴你天氣狀況 ⏰"
         
-    def enhance_message(self, msg: str) -> str:
-        """增強消息內容，但避免過度強調時間"""
+        if any(keyword in msg for keyword in self.weather_patterns['unsubscribe']):
+            self.weather_service.unsubscribe(user_id)
+            return "已取消天氣推播訂閱。"
+        
+        try:
+            # 天氣查詢
+            weather_data = await self.weather_service.get_weather()
+            
+            # 溫度查詢
+            if any(keyword in msg for keyword in self.weather_patterns['temperature']):
+                return f"🌡️ 現在溫度是 {weather_data.temperature}°C"
+            
+            # 濕度查詢
+            if any(keyword in msg for keyword in self.weather_patterns['humidity']):
+                return f"💧 現在濕度是 {weather_data.humidity}%"
+            
+            # 體感溫度查詢
+            if any(keyword in msg for keyword in self.weather_patterns['feels_like']):
+                return f"🌡️ 現在體感溫度是 {weather_data.feels_like}°C"
+            
+            # 一般天氣查詢
+            if any(keyword in msg for keyword in self.weather_patterns['general']):
+                return weather_data.format_message()
+            
+        except Exception as e:
+            logging.error(f"Error handling weather query: {e}")
+            return "抱歉，獲取天氣信息時發生錯誤。"
+        
+        return None
+    
+    async def enhance_message(self, msg: str, user_id: str) -> str:
+        """增強消息內容，包含時間和天氣處理"""
+        # 檢查是否是天氣相關查詢
+        weather_response = await self.handle_weather_query(msg, user_id)
+        if weather_response:
+            return weather_response
+        
+        # 原有的時間處理邏輯
         current_time = time.time()
         
-        # 定義關鍵詞和其重要性
         patterns = {
-            'high_priority': ['幾點', '現在時間', '日期', '幾號'],  # 直接詢問時間的關鍵詞
-            'low_priority': ['早', '午', '晚', 'hi', 'hello', '你好', '哈囉']  # 日常問候詞
+            'high_priority': ['幾點', '現在時間', '日期', '幾號'],
+            'low_priority': ['早', '午', '晚', 'hi', 'hello', '你好', '哈囉']
         }
         
-        # 檢查是否包含高優先級時間相關關鍵詞
         if any(keyword in msg for keyword in patterns['high_priority']):
             return f"{self.time_context.get_detailed_context()}\n{msg}"
             
-        # 檢查是否包含低優先級問候語
         if any(keyword in msg.lower() for keyword in patterns['low_priority']):
-            # 如果距離上次提到時間超過30分鐘，才加入時間問候
-            if current_time - self._last_time_mention > 1800:  # 1800秒 = 30分鐘
+            if current_time - self._last_time_mention > 1800:
                 self._last_time_mention = current_time
                 greeting = self.time_context.get_greeting()
-                # 只返回問候語，不附加具體時間
                 return f"{greeting} {msg}"
             else:
-                # 如果最近才提過時間，就只回覆簡單的問候
                 return f"你好！{msg}"
                 
-        # 對於其他消息，直接返回原始消息
         return msg
+    
+    async def enhance_message_with_time_context(self, msg: str, user_id: str) -> str:
+        """保持原有方法名稱的兼容性"""
+        return await self.enhance_message(msg, user_id)
+
+# 添加 WeatherScheduler 類
+class WeatherScheduler:
+    def __init__(self, bot: commands.Bot, weather_service: WeatherService):
+        self.bot = bot
+        self.weather_service = weather_service
+        self.broadcast_time = datetime_time(hour=6, minute=0)  # 使用 datetime.tim
+        self.scheduler_started = False
+    
+    async def broadcast_weather(self):
+        max_retries = 3
+        retry_delay = 60  # 1分鐘
+        
+        for attempt in range(max_retries):
+            try:
+                weather_data = await self.weather_service.fetch_weather()
+                message = (
+                    "🌅 早安！這是今天的天氣預報：\n\n" +
+                    weather_data.format_message()
+                )
+                
+                for user_id in self.weather_service.subscribers:
+                    try:
+                        user = await self.bot.fetch_user(int(user_id))
+                        await user.send(message)
+                    except Exception as e:
+                        logging.error(f"Failed to send weather to user {user_id}: {e}")
+                break  # 成功後跳出循環
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logging.error(f"Failed to broadcast weather after {max_retries} attempts: {e}")
+                else:
+                    logging.warning(f"Broadcast attempt {attempt + 1} failed: {e}, retrying...")
+                    await asyncio.sleep(retry_delay)
+
+    async def schedule_weather_broadcast(self):
+        """定時廣播天氣信息"""
+        while True:
+            try:
+                now = datetime.now(pytz.timezone('Asia/Taipei'))
+                target_time = now.replace(
+                    hour=self.broadcast_time.hour,
+                    minute=self.broadcast_time.minute,
+                    second=0,
+                    microsecond=0
+                )
+                
+                if now >= target_time:
+                    target_time += timedelta(days=1)
+                
+                delay = (target_time - now).total_seconds()
+                logging.info(f"Next weather broadcast scheduled in {delay} seconds")
+                
+                await asyncio.sleep(delay)
+                await self.broadcast_weather()
+                
+            except Exception as e:
+                logging.error(f"Error in weather scheduler: {e}")
+                await asyncio.sleep(60)  # 發生錯誤時等待1分鐘後重試
+                
+    def start(self):
+        """開始天氣廣播排程"""
+        if not self.scheduler_started:
+            asyncio.create_task(self.schedule_weather_broadcast())
+            self.scheduler_started = True
+
+
 
 def choose_model_based_on_message(msg: str, fallback_level: int = 0) -> str:
     """根據消息長度和fallback級別選擇合適的模型"""
@@ -238,46 +501,43 @@ async def get_ai_response(msg: str, user_id: str, conversation_history: List[Dic
 
     return reply_msg
 
+# 修改 on_ready 事件以啟動天氣排程
 @bot.event
 async def on_ready():
     logging.info(f'{bot.user} has connected to Discord!')
+    weather_scheduler.start()
+    logging.info("Weather scheduler started")
 
+# 修正 on_message 事件處理
 @bot.event
 async def on_message(message):
-    # 忽略機器人自己的消息
     if message.author == bot.user:
         return
 
-    # 處理命令
     await bot.process_commands(message)
 
     try:
         should_respond = False
         content = message.content
         
-        # 檢查是否為私訊
         if isinstance(message.channel, discord.DMChannel):
             should_respond = True
             logging.info(f"Received DM: {content}")
-        # 檢查是否有提及機器人
         elif bot.user.mentioned_in(message):
             should_respond = True
-            # 移除提及並獲取實際消息內容
             content = message.clean_content.replace(f'@{bot.user.display_name}', '').strip()
             logging.info(f"Mentioned in channel: {content}")
 
         if should_respond:
-            message_handler = MessageHandler()
-            
             if content == "忘掉一切吧":
                 clear_conversation_history(str(message.author.id))
                 await message.reply("已經忘掉所有過去的對話紀錄。")
                 return
 
-            # 增加時間上下文
-            enhanced_msg = message_handler.enhance_message_with_time_context(content)
+            # 使用全局的 weather_service
+            message_handler = MessageHandler(weather_service)
+            enhanced_msg = await message_handler.enhance_message_with_time_context(content, str(message.author.id))
             
-            # 獲取對話歷史
             conversation_history = get_conversation_history(str(message.author.id))
             conversation_history.append({"role": "user", "content": enhanced_msg})
 
@@ -285,18 +545,20 @@ async def on_message(message):
                 reply_msg = await get_ai_response(enhanced_msg, str(message.author.id), conversation_history)
             
             await message.reply(reply_msg)
-            
-            # 保存對話記錄
             add_message_to_firebase(str(message.author.id), content, reply_msg)
 
     except Exception as e:
         logging.error(f"Error processing message: {e}")
         await message.reply("抱歉，處理訊息時發生錯誤。")
 
+
 # 全局變量追踪
 bot_started = False
 bot_thread = None
 event_loop = None
+weather_service = WeatherService(OPENWEATHER_API_KEY)
+weather_scheduler = WeatherScheduler(bot, weather_service)
+logging.info("Weather service and scheduler initialized")
 
 def run_discord_bot():
     """在背景執行 Discord bot"""

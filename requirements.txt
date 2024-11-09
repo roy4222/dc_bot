@@ -6,9 +6,15 @@ flask==2.*
 discord.py>=2.3.0
 aiohttp==3.8.5
 
-# 數據庫和請求
+# Firebase 相關
 firebase-admin>=6.2.0
+
+# HTTP 請求
 requests>=2.31.0
 
 # 時間處理
 pytz>=2024.1
+
+# 數據類型支持
+typing-extensions>=4.9.0
+dataclasses>=0.6; python_version < "3.7"
